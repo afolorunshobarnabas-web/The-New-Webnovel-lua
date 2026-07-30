@@ -1,56 +1,117 @@
-# ==========================================
-# OFFICIAL SHOSETSU EXTENSION CI/CD WORKFLOW
-# ==========================================
+# GitHub Actions conversion of your GitLab CI pipeline
+# - Job: build_extensions -> builds with Gradle (attempts assembleDebug, falls back to build)
+# - Job: test_parsers -> downloads artifacts and runs extension-tester.jar
+on:
+  push:
+  pull_request:
 
-# Defines the sequence of execution stages
-stages:
-  - build
-  - test
-
-# Global variables used across jobs
-variables:
-  # Instructs Gradle to use a local cache to speed up subsequent pipeline runs
+env:
   GRADLE_OPTS: "-Dorg.gradle.daemon=false"
 
-# ------------------------------------------
-# JOB 1: Build and Compile Extensions
-# ------------------------------------------
-build_extensions:
-  stage: build
-  # Official Android/Java build image matching Shosetsu's framework requirements
-  image: eclipse-temurin:17-jdk-alpine
-  before_script:
-    - apk add --no-cache bash git curl
-    - chmod +x ./gradlew || true
-  script:
-    # Compiles the repository extensions and generates the multi-extension packages
-    - ./gradlew assembleDebug || ./gradlew build
-  artifacts:
-    name: "shosetsu-extensions-build-${CI_COMMIT_REF_SLUG}"
-    when: on_success
-    expire_in: 1 week
-    paths:
-      # Saves the compiled extension packages for download or testing
-      - "**/build/outputs/**/*.apk"
-      - "**/build/libs/**/*.jar"
+jobs:
+  build_extensions:
+    name: Build and compile extensions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-# ------------------------------------------
-# JOB 2: Run Automated Parser Testing
-# ------------------------------------------
-test_parsers:
-  stage: test
-  image: eclipse-temurin:17-jdk-alpine
-  before_script:
-    - apk add --no-cache bash git
-    - chmod +x ./test-server.sh || true
-  script:
-    # 1. Regenerates the unified index configuration index.json mapping file
-    - java -jar bin/extension-tester.jar --generate-index
-    
-    # 2. Runs structural automated sanity checks on your specific extension ID
-    - java -jar bin/extension-tester.jar --id 982374105 --listings 1
-  artifacts:
-    when: always
-    expire_in: 1 week
-    paths:
-      - index.json
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-cache-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties') }}
+          restore-keys: gradle-cache-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew || true
+
+      - name: Install Android SDK command-line tools (so assembleDebug can run)
+        # This installs minimal command-line SDK, platform-tools, build-tools, and a recent platform.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip qemu-user-static
+          export ANDROID_SDK_ROOT="${HOME}/android-sdk"
+          mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools"
+          cd "${HOME}"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline.zip
+          unzip -q cmdline.zip -d "${ANDROID_SDK_ROOT}/cmdline-tools"
+          # Move to "latest" subdir expected by sdkmanager
+          mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools/latest"
+          mv "${ANDROID_SDK_ROOT}/cmdline-tools"/cmdline-tools/* "${ANDROID_SDK_ROOT}/cmdline-tools/latest/" || true
+          export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
+          yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" "platform-tools" "platforms;android-33" "build-tools;33.0.2" "cmdline-tools;latest"
+          yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses || true
+        shell: bash
+
+      - name: Build (assembleDebug || build)
+        run: |
+          ./gradlew assembleDebug || ./gradlew build
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.home }}/android-sdk
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shosetsu-extensions-build
+          path: |
+            **/build/outputs/**/*.apk
+            **/build/libs/**/*.jar
+            bin/extension-tester.jar
+
+  test_parsers:
+    name: Run automated parser testing
+    runs-on: ubuntu-latest
+    needs: build_extensions
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: shosetsu-extensions-build
+          path: ./artifacts
+
+      - name: Make test server script executable
+        run: chmod +x ./test-server.sh || true
+
+      - name: Run extension tester - generate index
+        run: |
+          if [ -f "./artifacts/bin/extension-tester.jar" ]; then
+            java -jar ./artifacts/bin/extension-tester.jar --generate-index
+          elif [ -f "./bin/extension-tester.jar" ]; then
+            java -jar ./bin/extension-tester.jar --generate-index
+          else
+            echo "extension-tester.jar not found; failing job."
+            exit 1
+          fi
+
+      - name: Run extension tester - run listings for specific ID
+        run: |
+          if [ -f "./artifacts/bin/extension-tester.jar" ]; then
+            java -jar ./artifacts/bin/extension-tester.jar --id 982374105 --listings 1
+          else
+            java -jar ./bin/extension-tester.jar --id 982374105 --listings 1
+          fi
+
+      - name: Upload index.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: index.json
+          path: index.json
